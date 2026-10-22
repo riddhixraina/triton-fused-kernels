@@ -1,0 +1,9 @@
+GPU: NVIDIA A100-SXM4-40GB
+llama3-8b decoder layer, 4 x 2048 = 8,192 tokens, bf16. Max output difference, fused vs eager: 0.0312
+
+version            step ms  vs eager  peak GB  vs eager
+eager                56.61     1.00x     3.46     +0.0%
+triton kernels       46.60     1.21x     3.19     -7.8%
+torch.compile        46.66     1.21x     3.19     -7.8%
+
+step ms is one forward plus backward pass. peak GB is the most GPU memory allocated during a step, including weights and gradients.
