@@ -44,3 +44,41 @@ rmsnorm         2048     ...
 - **tokens = 1** is a single decode step. The tensors are tiny, so kernel launch overhead dominates and nothing gets near peak bandwidth.
 - **tokens = 2048 and up** looks like prefill. This is where the fused kernels should approach peak bandwidth, and where the speedup over eager is clearest.
 - **torch.compile** also fuses these ops, so expect it to be close to Triton. 
+
+## Results
+
+NVIDIA A100-SXM4-40GB (peak 1,555 GB/s), bf16, Qwen2.5-7B shapes (hidden 3584, intermediate 18944).
+Times are the median of 100 runs. `% peak` is the memory bandwidth the Triton kernel achieves.
+
+| Op | Tokens | Eager (ms) | torch.compile (ms) | Triton (ms) | Speedup vs eager | GB/s | % peak |
+|---|---|---|---|---|---|---|---|
+| rmsnorm | 1 | 0.0471 | 0.0102 | 0.0082 | 5.75x | 2 | 0% |
+| rmsnorm | 16 | 0.0461 | 0.0072 | 0.0072 | 6.43x | 32 | 2% |
+| rmsnorm | 128 | 0.0532 | 0.0082 | 0.0082 | 6.50x | 224 | 14% |
+| rmsnorm | 512 | 0.0758 | 0.0102 | 0.0102 | 7.40x | 717 | 46% |
+| rmsnorm | 2048 | 0.2560 | 0.0297 | 0.0246 | 10.42x | 1195 | 77% |
+| rmsnorm | 8192 | 0.9400 | 0.0942 | 0.0942 | 9.98x | 1247 | 80% |
+| add+rmsnorm | 1 | 0.0522 | 0.0082 | 0.0082 | 6.37x | 4 | 0% |
+| add+rmsnorm | 16 | 0.0614 | 0.0082 | 0.0082 | 7.50x | 56 | 4% |
+| add+rmsnorm | 128 | 0.0717 | 0.0102 | 0.0092 | 7.78x | 398 | 26% |
+| add+rmsnorm | 512 | 0.1147 | 0.0184 | 0.0174 | 6.59x | 843 | 54% |
+| add+rmsnorm | 2048 | 0.4485 | 0.0512 | 0.0512 | 8.76x | 1147 | 74% |
+| add+rmsnorm | 8192 | 1.6568 | 0.1833 | 0.1782 | 9.30x | 1318 | 85% |
+| silu_and_mul | 1 | 0.0102 | 0.0072 | 0.0072 | 1.43x | 16 | 1% |
+| silu_and_mul | 16 | 0.0174 | 0.0092 | 0.0092 | 1.89x | 197 | 13% |
+| silu_and_mul | 128 | 0.0358 | 0.0195 | 0.0195 | 1.84x | 748 | 48% |
+| silu_and_mul | 512 | 0.1116 | 0.0573 | 0.0553 | 2.02x | 1052 | 68% |
+| silu_and_mul | 2048 | 0.3922 | 0.1874 | 0.1823 | 2.15x | 1277 | 82% |
+| silu_and_mul | 8192 | 1.5135 | 0.7066 | 0.6932 | 2.18x | 1343 | 86% |
+
+Llama 3 8B shapes (hidden 4096, intermediate 14336) give the same picture at 8,192 tokens:
+rmsnorm 10.02x at 81% of peak, add+rmsnorm 9.34x at 86%, silu_and_mul 2.19x at 86%.
+Full results: `results_bf16.csv`, `results_llama_bf16.csv`, `results_fp16.csv`.
+
+### Reading the results
+
+- **1 to 16 tokens** is a single decode step. Every version takes 7 to 10 µs, which is the fixed cost of launching a kernel, so bandwidth stays under 5% of peak. This is why inference servers like vLLM capture decode steps in CUDA graphs.
+- **2,048 tokens and up** looks like prefill. The fused kernels reach 77 to 86% of peak bandwidth, and RMSNorm runs about 10x faster than eager PyTorch, which launches around six kernels and re-reads the tensor for each.
+- **SwiGLU gains less (about 2.2x)** because eager PyTorch already does it in two kernels, so there's less wasted memory traffic to remove.
+- **torch.compile** also fuses these ops, and the Triton kernels match it to within 3%.
+- **add+rmsnorm** first reached only 56% of peak, 48% slower than torch.compile. The wrapper cloned the residual before the kernel ran, a hidden extra read and write of the whole tensor. Writing the new residual to a fresh buffer instead lifted it to 85%, 3% faster than torch.compile.
