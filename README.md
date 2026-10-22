@@ -43,17 +43,4 @@ rmsnorm         2048     ...
 
 - **tokens = 1** is a single decode step. The tensors are tiny, so kernel launch overhead dominates and nothing gets near peak bandwidth.
 - **tokens = 2048 and up** looks like prefill. This is where the fused kernels should approach peak bandwidth, and where the speedup over eager is clearest.
-- **torch.compile** also fuses these ops, so expect it to be close to Triton. That's a fair result to report: it shows you understand why fusion helps, not just that your kernel won.
-
-## What to put on your resume
-
-Fill in the brackets from your own run. Use the largest token count, and name the GPU:
-
-> Wrote fused RMSNorm and SwiGLU kernels in Triton for Qwen and Llama layers, cutting memory traffic to one read and one write per element and running [X]× faster than PyTorch eager at [Y]% of peak memory bandwidth on an [A100].
-
-## Questions to be ready for
-
-- **Why is RMSNorm memory-bound?** About 4 FLOPs per element against 4 to 8 bytes moved. GPUs do orders of magnitude more FLOPs per second than they move bytes, so memory is the limit.
-- **Why one program per row?** The whole row (up to 8,192 values) fits in registers, so the sum of squares needs no second pass over memory.
-- **Why compute in fp32?** Summing thousands of fp16 squares loses precision, so the kernel accumulates in fp32 and rounds once on store.
-- **What would you do next?** Use `triton.autotune` to pick `num_warps` and block sizes per GPU, write the backward pass for training, and compare against vLLM's CUDA `fused_add_rms_norm`.
+- **torch.compile** also fuses these ops, so expect it to be close to Triton. 
