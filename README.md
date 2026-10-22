@@ -1,6 +1,6 @@
 # Fused Transformer Kernels in Triton
 
-Three fused GPU kernels for the memory-bound ops in every Llama and Qwen decoder layer, benchmarked against PyTorch eager and `torch.compile`.
+Three fused GPU kernels for the memory-bound ops in every Llama and Qwen decoder layer, benchmarked against PyTorch eager and `torch.compile`. Each one also has a backward pass for training, and RMSNorm has a CUDA C++ version for comparison with Triton.
 
 | Kernel | What it computes | Where it runs in the model |
 |---|---|---|
@@ -16,7 +16,7 @@ So the goal is not "faster than PyTorch" in the abstract. It's **how close each 
 
 ## Run it
 
-You need an NVIDIA GPU. A free Colab T4 works; NYU HPC's A100s are better.
+You need an NVIDIA GPU. A free Colab T4 runs the inference benchmarks. The training and CUDA benchmarks use bf16, so they need an A100 or newer.
 
 ```bash
 pip install -r requirements.txt
@@ -26,7 +26,15 @@ python bench.py                             # Qwen2.5-7B shapes, fp16
 python bench.py --model llama3-8b --dtype bf16 --csv llama_bf16.csv   # bf16 needs A100 or newer
 ```
 
-Without a GPU, `pytest` still runs the kernels in Triton's CPU interpreter (fp32 only), so you can check correctness on a laptop.
+Training kernels, a full decoder layer, and the CUDA version (bf16, so an A100):
+
+```bash
+python bench_train.py --dtype bf16          # forward plus backward, per op
+python bench_layer.py --model llama3-8b     # one training step of a whole decoder layer
+python bench_cuda.py --dtype bf16           # RMSNorm: eager vs Triton vs CUDA C++
+```
+
+Without a GPU, `pytest` still runs the Triton kernels and their gradients in Triton's CPU interpreter (fp32 only), so you can check correctness on a laptop. The CUDA tests are skipped.
 
 On Colab: Runtime → Change runtime type → T4 GPU, then in a cell:
 
@@ -82,3 +90,19 @@ Full results: `results_bf16.csv`, `results_llama_bf16.csv`, `results_fp16.csv`.
 - **SwiGLU gains less (about 2.2x)** because eager PyTorch already does it in two kernels, so there's less wasted memory traffic to remove.
 - **torch.compile** also fuses these ops, and the Triton kernels match it to within 3%.
 - **add+rmsnorm** first reached only 56% of peak, 48% slower than torch.compile. The wrapper cloned the residual before the kernel ran, a hidden extra read and write of the whole tensor. Writing the new residual to a fresh buffer instead lifted it to 85%, 3% faster than torch.compile.
+
+## Training kernels
+
+`training.py` wraps each kernel in a `torch.autograd.Function`, so `rmsnorm_train`, `fused_add_rmsnorm_train` and `silu_and_mul_train` can replace the eager ops in a training loop. `test_training.py` checks every output and gradient against eager autograd.
+
+- **Forward** works like the inference kernels, and the norms also save one fp32 `rstd` value per row for the backward pass. Eager autograd saves several full-size intermediate tensors instead.
+- **Backward** is one kernel per op. For RMSNorm, with `g = dy * w`, the input gradient is `rstd * g - x * rstd³ * mean(g * x)`, computed from the saved `x` and `rstd`.
+- **The weight gradient** sums `dy * x * rstd` over every row. One program per row would need a buffer as large as the input to hold the partial sums. Instead, one program per GPU streaming multiprocessor loops over a slice of rows and keeps its partial sum in registers, so the buffer is only 108 rows on an A100.
+- **add+rmsnorm** saves the summed residual rather than both inputs, and both inputs get the same gradient: the norm's gradient plus the gradient flowing back through the residual stream.
+
+`bench_train.py` times one forward plus backward pass per op. `bench_layer.py` times a training step of a whole Llama or Qwen decoder layer (attention, MLP, norms and residuals, without rotary embeddings) with the eager ops versus the Triton kernels, and also reports peak GPU memory, since saving less for the backward pass leaves more memory for activations.
+
+## CUDA C++ version
+
+`csrc/rmsnorm.cu` implements the same RMSNorm in CUDA C++, built at runtime by `cuda_rmsnorm.py` with `torch.utils.cpp_extension`. One thread block handles one row. Each thread loads 16 bytes at a time (8 bf16 values), sums squares in fp32, and the block combines the per-thread sums with warp shuffles. A second pass rereads the row, mostly from cache, and writes the output. `bench_cuda.py` compares it with the Triton kernel and eager PyTorch at the same shapes.
+
